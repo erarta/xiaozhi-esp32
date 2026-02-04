@@ -1,6 +1,7 @@
 #include "wifi_board.h"
 #include "codecs/es8311_audio_codec.h"
 #include "display/lcd_display.h"
+#include "display/emoji_carousel.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
@@ -26,6 +27,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "power_manager.h"
+#include <lvgl.h>
+#include <cstdlib>
 
 #define TAG "Spotpear_ESP32_S3_1_28_BOX"
 
@@ -120,6 +123,42 @@ public:
         // 由于屏幕是圆的，所以状态栏需要增加左右内边距
         lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES * 0.33, 0);
         lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES * 0.33, 0);
+
+        // LUNA.AI: Hide emoji elements when using vector faces
+        DeleteEmojiElements();
+    }
+
+    // Permanently hide emoji elements for vector face mode
+    void DeleteEmojiElements() {
+        // Move emoji elements off-screen and hide them
+        if (emoji_box_ != nullptr) {
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_pos(emoji_box_, -500, -500);  // Move off-screen
+        }
+        if (emoji_label_ != nullptr) {
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_size(emoji_label_, 0, 0);  // Zero size
+        }
+        if (emoji_image_ != nullptr) {
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_size(emoji_image_, 0, 0);  // Zero size
+        }
+        ESP_LOGI("CustomLcdDisplay", "Hidden emoji elements for vector face mode");
+    }
+
+    // Override SetEmotion to prevent emoji display AND re-hide if needed
+    virtual void SetEmotion(const char* emotion) override {
+        // Don't show emoji - we use vector faces instead
+        // Also re-hide elements in case they got unhidden
+        if (emoji_box_ != nullptr) {
+            lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_label_ != nullptr) {
+            lv_obj_add_flag(emoji_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (emoji_image_ != nullptr) {
+            lv_obj_add_flag(emoji_image_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 };
 
@@ -135,6 +174,41 @@ private:
     PowerSaveTimer* power_save_timer_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     PowerManager* power_manager_ = nullptr;
+    EmojiCarousel* emoji_carousel_ = nullptr;
+
+    // Swipe detection for emoji switching
+    int touch_start_x_ = -1;
+    int touch_start_y_ = -1;
+    static constexpr int SWIPE_THRESHOLD = 50;
+
+    void InitializeEmojiCarousel() {
+        ESP_LOGI(TAG, "InitializeEmojiCarousel starting...");
+
+        if (!display_) {
+            ESP_LOGE(TAG, "Display not initialized, skipping EmojiCarousel");
+            return;
+        }
+
+        emoji_carousel_ = new EmojiCarousel();
+        if (!emoji_carousel_) {
+            ESP_LOGE(TAG, "Failed to create EmojiCarousel");
+            return;
+        }
+
+        // Create emoji on display's LVGL screen with proper locking
+        {
+            DisplayLockGuard lock(display_);
+            lv_obj_t* screen = lv_screen_active();
+            if (screen) {
+                emoji_carousel_->Create(screen);
+                ESP_LOGI(TAG, "EmojiCarousel created with %d emojis", emoji_carousel_->GetEmojiCount());
+            } else {
+                ESP_LOGE(TAG, "No active screen!");
+            }
+        }
+
+        ESP_LOGI(TAG, "InitializeEmojiCarousel complete");
+    }
 
     void InitializePowerSaveTimer() {
         rtc_gpio_init(GPIO_NUM_3);
@@ -231,13 +305,29 @@ private:
         if (touch_point.num > 0 && !was_touched) {
             was_touched = true;
             touch_start_time = esp_timer_get_time() / 1000; // 转换为毫秒
+            board->touch_start_x_ = touch_point.x;
+            board->touch_start_y_ = touch_point.y;
         }
         // 检测触摸释放
         else if (touch_point.num == 0 && was_touched) {
             was_touched = false;
             int64_t touch_duration = (esp_timer_get_time() / 1000) - touch_start_time;
 
-            // 只有短触才触发
+            // Check for swipe gesture to change emoji
+            int dx = touch_point.x - board->touch_start_x_;
+            if (board->emoji_carousel_ && abs(dx) > SWIPE_THRESHOLD) {
+                // Swipe detected - switch emoji
+                DisplayLockGuard lock(board->display_);
+                if (dx > 0) {
+                    board->emoji_carousel_->PreviousEmoji();
+                } else {
+                    board->emoji_carousel_->NextEmoji();
+                }
+                ESP_LOGI(TAG, "Swipe %s, emoji: %d", dx > 0 ? "right" : "left", board->emoji_carousel_->GetCurrentIndex());
+                return;
+            }
+
+            // 只有短触才触发 (tap to toggle chat)
             if (touch_duration < TOUCH_THRESHOLD_MS) {
                 auto& app = Application::GetInstance();
                 // During startup (before connected), pressing touch enters Wi-Fi config mode without reboot
@@ -391,12 +481,19 @@ public:
             GetBacklight()->RestoreBrightness();
         }
 
+        // Initialize emoji carousel (20 funny emojis with swipe)
+        InitializeEmojiCarousel();
+
         // 显示和背光可用后再初始化省电逻辑，避免空指针
         InitializePowerSaveTimer();
         InitializePowerManager();
     }
 
     ~Spotpear_ESP32_S3_1_28_BOX() {
+        if (emoji_carousel_) {
+            delete emoji_carousel_;
+            emoji_carousel_ = nullptr;
+        }
         if (touchpad_timer_) {
             esp_timer_stop(touchpad_timer_);
             esp_timer_delete(touchpad_timer_);
